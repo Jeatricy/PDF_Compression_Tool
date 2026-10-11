@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 import io
+import hashlib
+import os
 from pathlib import Path
 import threading
 import queue
@@ -30,6 +32,54 @@ def pil_downscale(img: Image.Image, scale_percent: int) -> Image.Image:
     new_w = max(1, int(img.width * scale_percent / 100))
     new_h = max(1, int(img.height * scale_percent / 100))
     return img.resize((new_w, new_h), Image.LANCZOS)
+
+
+def _path_key(path: Path) -> str:
+    return os.path.normcase(str(path.resolve()))
+
+
+def _unique_pdfs(pdfs: list[Path]) -> list[Path]:
+    unique = []
+    seen = set()
+    for pdf in pdfs:
+        key = _path_key(pdf)
+        if key not in seen:
+            seen.add(key)
+            unique.append(pdf)
+    return unique
+
+
+def _build_output_paths(pdfs: list[Path], out_dir: Path | None, suffix: str) -> list[Path]:
+    candidates = [
+        (out_dir / (pdf.stem + suffix + ".pdf")) if out_dir else
+        pdf.with_name(pdf.stem + suffix + pdf.suffix)
+        for pdf in pdfs
+    ]
+    source_keys = {_path_key(pdf) for pdf in pdfs}
+    candidate_counts = {}
+    for candidate in candidates:
+        key = _path_key(candidate)
+        candidate_counts[key] = candidate_counts.get(key, 0) + 1
+
+    outputs = []
+    used = set()
+    for pdf, candidate in zip(pdfs, candidates):
+        target = candidate
+        key = _path_key(target)
+        if candidate_counts[key] > 1 or key in source_keys or key in used:
+            digest = hashlib.sha256(_path_key(pdf).encode("utf-8")).hexdigest()[:10]
+            target = candidate.with_name(f"{candidate.stem}_{digest}{candidate.suffix}")
+            key = _path_key(target)
+            counter = 2
+            while key in source_keys or key in used:
+                target = candidate.with_name(
+                    f"{candidate.stem}_{digest}_{counter}{candidate.suffix}"
+                )
+                key = _path_key(target)
+                counter += 1
+        outputs.append(target)
+        used.add(key)
+    return outputs
 
 
 def convert_pdf(in_pdf: Path,
@@ -71,9 +121,7 @@ def convert_pdf(in_pdf: Path,
                 bw_img.save(buf, format="PNG", optimize=True)
                 img_bytes = buf.getvalue()
                 buf.close()
-                page_width_pts = (bw_img.width / dpi) * 72.0
-                page_height_pts = (bw_img.height / dpi) * 72.0
-                rect = fitz.Rect(0, 0, page_width_pts, page_height_pts)
+                rect = page.rect
                 new_page = out.new_page(width=rect.width, height=rect.height)
                 new_page.insert_image(rect, stream=img_bytes)
 
@@ -101,17 +149,12 @@ def convert_pdf(in_pdf: Path,
                         save_img.save(buf, format="JPEG", quality=q, optimize=True, progressive=True)
                     img_bytes = buf.getvalue()
                     buf.close()
-                    page_width_pts = (img.width / dpi) * 72.0
-                    page_height_pts = (img.height / dpi) * 72.0
                 else:
                     save_img = img.convert("L") if img.mode == "L" else img
                     save_img.save(buf, format="PNG", optimize=True)
                     img_bytes = buf.getvalue()
                     buf.close()
-                    page_width_pts = (img.width / dpi) * 72.0
-                    page_height_pts = (img.height / dpi) * 72.0
-
-                rect = fitz.Rect(0, 0, page_width_pts, page_height_pts)
+                rect = page.rect
                 new_page = out.new_page(width=rect.width, height=rect.height)
                 new_page.insert_image(rect, stream=img_bytes)
 
@@ -143,15 +186,15 @@ def batch_process(inputs: list[Path],
         print("未找到任何 PDF。")
         return
 
+    pdfs = _unique_pdfs(pdfs)
+    out_paths = _build_output_paths(pdfs, out_dir, suffix)
+
     total = len(pdfs)
     ok = 0
-    for idx, pdf in enumerate(pdfs, start=1):
+    for idx, (pdf, out_path) in enumerate(zip(pdfs, out_paths), start=1):
         try:
             if out_dir:
                 out_dir.mkdir(parents=True, exist_ok=True)
-                out_path = out_dir / (pdf.stem + suffix + ".pdf")
-            else:
-                out_path = pdf.with_name(pdf.stem + suffix + pdf.suffix)
             print(f"[{idx}/{total}] 处理：{pdf} -> {out_path}")
             convert_pdf(pdf, out_path, mode=mode, threshold=threshold, dpi=dpi,
                         use_jpeg=use_jpeg, jpeg_quality=jpeg_quality, downscale_percent=downscale_percent,
@@ -484,7 +527,7 @@ def run_gui():
 
             mode = self.mode_var.get()
             threshold = int(self.thr_var.get())
-            suffix = self.suffix_var.get().strip() or "_cmp"
+            suffix = self.suffix_var.get().strip() or "_压缩"
             out_dir = Path(self.out_dir_var.get().strip()) if self.out_dir_var.get().strip() else None
             use_jpeg = bool(self.use_jpeg_var.get())
             jpeg_quality = int(self.jpeg_q_var.get())
@@ -524,18 +567,18 @@ def run_gui():
                 self.queue.put(("done", "未找到任何 PDF。"))
                 return
 
+            pdfs = _unique_pdfs(pdfs)
+            out_paths = _build_output_paths(pdfs, out_dir, suffix)
+
             ok = 0
-            for idx, pdf in enumerate(pdfs, start=1):
+            total = len(pdfs)
+            for idx, (pdf, out_path) in enumerate(zip(pdfs, out_paths), start=1):
                 if self.stop_flag.is_set():
                     self.queue.put(("log", "用户停止。"))
                     break
                 try:
                     if out_dir:
                         out_dir.mkdir(parents=True, exist_ok=True)
-                        out_path = out_dir / (pdf.stem + suffix + ".pdf")
-                    else:
-                        out_path = pdf.with_name(pdf.stem + suffix + pdf.suffix)
-
                     def cb(s):
                         self.queue.put(("status", s))
 
@@ -564,19 +607,34 @@ def run_gui():
 # -------------------------
 # 主入口：解析命令行
 # -------------------------
+def _bounded_int(minimum: int, maximum: int, label: str):
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(f"{label}必须是整数。") from exc
+        if not minimum <= parsed <= maximum:
+            raise argparse.ArgumentTypeError(
+                f"{label}必须在 {minimum}–{maximum} 之间。"
+            )
+        return parsed
+    return parse
+
+
 def main():
     parser = argparse.ArgumentParser(description="PDF 压缩工具")
     parser.add_argument("--no-gui", action="store_true", help="不启动 GUI（使用命令行模式）")
     parser.add_argument("--input", "-i", nargs="+", help="要处理的文件或文件夹（命令行模式）")
     parser.add_argument("--out", "-o", help="输出目录（命令行模式）")
-    parser.add_argument("--suffix", "-s", default="_压缩", help="输出文件名后缀（默认 _压缩）")
+    parser.add_argument("--suffix", "-s", default="_cmp", help="输出文件名后缀（默认 _cmp）")
     parser.add_argument("--mode", choices=["gray", "bw", "color"], default="gray", help="处理模式：gray/bw/color（默认 gray）")
-    parser.add_argument("--threshold", type=int, default=180, help="二值化阈值，仅对 bw 有效（0-255）")
-    parser.add_argument("--dpi", type=int, default=200, help="渲染 DPI（默认 200）")
+    parser.add_argument("--threshold", type=_bounded_int(0, 255, "阈值"), default=180, help="二值化阈值，仅对 bw 有效（0-255）")
+    parser.add_argument("--dpi", type=_bounded_int(72, 1200, "DPI"), default=200, help="渲染 DPI（72-1200，默认 200）")
     parser.add_argument("--jpeg", dest="use_jpeg", action="store_true", help="使用 JPEG 压缩（默认）")
     parser.add_argument("--png", dest="use_jpeg", action="store_false", help="使用 PNG（无损）")
-    parser.add_argument("--quality", type=int, default=75, help="JPEG 质量（30-95，默认 75）")
-    parser.add_argument("--downscale", type=int, default=100, help="下采样百分比（50-100，默认 100）")
+    parser.set_defaults(use_jpeg=True)
+    parser.add_argument("--quality", type=_bounded_int(30, 95, "JPEG 质量"), default=75, help="JPEG 质量（30-95，默认 75）")
+    parser.add_argument("--downscale", type=_bounded_int(50, 100, "下采样百分比"), default=100, help="下采样百分比（50-100，默认 100）")
     args = parser.parse_args()
 
     if args.no_gui or (args.input and len(args.input) > 0):
